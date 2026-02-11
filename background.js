@@ -1,9 +1,65 @@
-
 importScripts('lib/socket.io.min.js');
 
 const DEFAULT_METUBE_URL = 'http://localhost:8081';
 let socket = null;
-const pendingContextMenuAdds = new Map(); // url -> { tabId, originalTitle }
+
+// URL Normalization for better matching
+function normalizeUrl(url) {
+    if (!url) return '';
+    try {
+        const u = new URL(url);
+        // Remove trailing slash and fragments/hashes
+        // Also strip 'www.' for better matching
+        let host = u.hostname.replace(/^www\./i, '');
+
+        let searchParams = new URLSearchParams(u.search);
+        // Stripping common "junk" parameters that often cause mismatches on YouTube
+        const junk = ['t', 'pp', 'si', 'feature', 'index', 'list', 'playnext', 'attr_tag'];
+        junk.forEach(p => searchParams.delete(p));
+
+        const cleanSearch = searchParams.toString();
+        let normalized = (u.protocol + '//' + host + u.pathname + (cleanSearch ? '?' + cleanSearch : '')).replace(/\/$/, '');
+        return normalized;
+    } catch (e) {
+        return url.replace(/\/$/, '');
+    }
+}
+
+// Persistent state management
+async function addPendingAdd(url, data) {
+    const normalizedUrl = normalizeUrl(url);
+    const result = await chrome.storage.session.get('pendingAdds');
+    const pendingAdds = result.pendingAdds || {};
+    pendingAdds[normalizedUrl] = data;
+    console.log('[MeTube] Storing pending add:', normalizedUrl, data);
+    await chrome.storage.session.set({ pendingAdds });
+}
+
+async function getPopPendingAdd(url) {
+    const normalizedUrl = normalizeUrl(url);
+    const result = await chrome.storage.session.get('pendingAdds');
+    const pendingAdds = result.pendingAdds || {};
+    const data = pendingAdds[normalizedUrl];
+
+    console.log('[MeTube] Looking up pending add:', normalizedUrl, 'Found:', data ? 'YES' : 'NO');
+
+    if (data) {
+        delete pendingAdds[normalizedUrl];
+        await chrome.storage.session.set({ pendingAdds });
+    }
+    return data;
+}
+
+async function clearPendingAdd(url) {
+    const normalizedUrl = normalizeUrl(url);
+    const result = await chrome.storage.session.get('pendingAdds');
+    const pendingAdds = result.pendingAdds || {};
+    if (pendingAdds[normalizedUrl]) {
+        console.log('[MeTube] Clearing pending add:', normalizedUrl);
+        delete pendingAdds[normalizedUrl];
+        await chrome.storage.session.set({ pendingAdds });
+    }
+}
 
 // Initialize socket connection
 function initSocket(url) {
@@ -19,54 +75,42 @@ function initSocket(url) {
     });
 
     socket.on('connect', () => {
-        console.log('Background connected to MeTube');
+        console.log('[MeTube] Background connected');
     });
 
     socket.on('completed', (strdata) => {
-        chrome.storage.sync.get(['enableNotifications'], (result) => {
-            if (result.enableNotifications) {
-                const item = JSON.parse(strdata);
-                const title = item.title || item.url || 'Download';
-                notifyActiveTab('success', 'Download Complete', title);
-            }
-        });
+        const item = JSON.parse(strdata);
+        console.log('[MeTube] Download completed:', item.title || item.url);
+        const title = item.title || item.url || 'Download';
+        notifyActiveTab('success', 'Download Complete', title);
     });
 
     socket.on('error', (strdata) => {
-        // Only trigger if enabled
-        chrome.storage.sync.get(['enableNotifications'], (result) => {
-            if (result.enableNotifications) {
-                // error event usually comes as string or object, depending on MeTube version
-                // But looking at popup.js, it seems we check item.status === 'error' in 'all'/'updated' events
-                // However, MeTube emits a specific 'error' event sometimes? 
-                // Let's stick to 'completed' and maybe 'updated' if status is error?
-                // Actually popup.js doesn't listen to 'error' event on socket, it sees status='error' in item updates.
-                // Let's mimic that.
-            }
-        });
+        console.error('[MeTube] Socket error event:', strdata);
     });
 
-    // MeTube emits 'updated' for progress/status changes. 
-    // We should check if status changed to 'error'
     socket.on('updated', (strdata) => {
-        chrome.storage.sync.get(['enableNotifications'], (result) => {
-            if (result.enableNotifications) {
-                const item = JSON.parse(strdata);
-                if (item.status === 'error') {
-                    const title = item.title || item.url || 'Download';
-                    notifyActiveTab('error', 'Download Failed', `${title}: ${item.msg || 'Unknown error'}`);
-                }
-            }
-        });
+        const item = JSON.parse(strdata);
+        if (item.status === 'error') {
+            console.error('[MeTube] Download failed:', item.title || item.url, item.msg);
+            const title = item.title || item.url || 'Download';
+            notifyActiveTab('error', 'Download Failed', `${title}: ${item.msg || 'Unknown error'}`);
+        }
     });
 
-    socket.on('added', (strdata) => {
+    socket.on('added', async (strdata) => {
         const item = JSON.parse(strdata);
-        const pending = pendingContextMenuAdds.get(item.url);
+        const urlToMatch = item.original_url || item.url;
+        console.log('[MeTube] Item added event:', urlToMatch);
+
+        const pending = await getPopPendingAdd(urlToMatch);
+
         if (pending) {
+            console.log('[MeTube] Found pending add for:', urlToMatch, 'notifying tab:', pending.tabId);
             const title = item.title || item.url || 'Download';
             notifyTab(pending.tabId, 'success', `Added: ${title}`, item.url);
-            pendingContextMenuAdds.delete(item.url);
+        } else {
+            console.log('[MeTube] No pending add found for:', urlToMatch, '- possibly added via popup.');
         }
     });
 }
@@ -76,15 +120,25 @@ function notifyActiveTab(status, title, message) {
 }
 
 function notifyTab(tabId, status, title, message) {
-    if (!tabId) {
-        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            if (tabs[0] && tabs[0].id) {
-                sendNotification(tabs[0].id, status, title, message);
-            }
-        });
-    } else {
-        sendNotification(tabId, status, title, message);
-    }
+    chrome.storage.sync.get(['enableNotifications'], (result) => {
+        const enabled = result.enableNotifications !== false; // Default to true if not set, or follow user
+        if (!enabled) {
+            console.log('[MeTube] Notifications disabled by user setting');
+            return;
+        }
+
+        if (!tabId) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+                if (tabs[0] && tabs[0].id) {
+                    console.log('[MeTube] Notifying active tab:', tabs[0].id, title);
+                    sendNotification(tabs[0].id, status, title, message);
+                }
+            });
+        } else {
+            console.log('[MeTube] Notifying specific tab:', tabId, title);
+            sendNotification(tabId, status, title, message);
+        }
+    });
 }
 
 function sendNotification(tabId, status, title, message) {
@@ -95,7 +149,7 @@ function sendNotification(tabId, status, title, message) {
         message: message
     }, (response) => {
         if (chrome.runtime.lastError) {
-            // Ignore error if content script is not ready or not injectable
+            console.warn('[MeTube] Could not send notification to tab (script not ready?):', chrome.runtime.lastError.message);
         }
     });
 }
@@ -163,21 +217,19 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
             notifyTab(tabId, 'info', addingTitle, url);
 
             // Track this add to show title in success notification later via socket
-            pendingContextMenuAdds.set(url, { tabId: tabId, originalTitle: pageTitle });
+            await addPendingAdd(url, { tabId: tabId, originalTitle: pageTitle });
 
             try {
                 const result = await addDownloadToMeTube(metubeUrl, options);
 
                 // If the API response already has a title, we can update the notification immediately
-                // However, often link additions don't have titles yet. 
-                // The socket listener for 'added' will handle it if we don't have it here.
                 if (result && result.title) {
                     notifyTab(tabId, 'success', `Added: ${result.title}`, url);
-                    pendingContextMenuAdds.delete(url);
+                    await clearPendingAdd(url);
                 }
             } catch (error) {
                 console.error('Failed to add download via context menu:', error);
-                pendingContextMenuAdds.delete(url);
+                await clearPendingAdd(url);
                 notifyTab(tabId, 'error', 'Failed to add to MeTube', `${error.message}\n${url}`);
             }
         });

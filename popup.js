@@ -454,7 +454,10 @@ function setLoading(isLoading) {
         `<svg class="icon" viewBox="0 0 24 24"><path d="M19,9h-4V3H9v6H5l7,7L19,9z M5,18v2h14v-2H5z"/></svg> Add To MeTube`;
 }
 
-function showToast(message) {
+async function showToast(message) {
+    const settings = await chrome.storage.sync.get(['enableNotifications']);
+    if (settings.enableNotifications === false) return;
+
     const toast = document.getElementById('toast');
     toast.textContent = message;
     toast.classList.add('show');
@@ -525,8 +528,12 @@ function renderDownloads(baseUrl) {
                     const left = Math.round((window.screen.availWidth - width) / 2);
                     const top = Math.round((window.screen.availHeight - height) / 2);
 
+                    // Robust base64 encoding for Unicode
+                    const b64Url = btoa(unescape(encodeURIComponent(videoUrl)));
+                    const b64Title = btoa(unescape(encodeURIComponent(title)));
+
                     chrome.windows.create({
-                        url: `player.html?url=${encodeURIComponent(videoUrl)}&title=${encodeURIComponent(title)}`,
+                        url: `player.html?b64_url=${b64Url}&b64_title=${b64Title}`,
                         type: 'popup',
                         width: width,
                         height: height,
