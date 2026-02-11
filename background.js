@@ -3,6 +3,7 @@ importScripts('lib/socket.io.min.js');
 
 const DEFAULT_METUBE_URL = 'http://localhost:8081';
 let socket = null;
+const pendingContextMenuAdds = new Map(); // url -> { tabId, originalTitle }
 
 // Initialize socket connection
 function initSocket(url) {
@@ -58,22 +59,43 @@ function initSocket(url) {
             }
         });
     });
+
+    socket.on('added', (strdata) => {
+        const item = JSON.parse(strdata);
+        const pending = pendingContextMenuAdds.get(item.url);
+        if (pending) {
+            const title = item.title || item.url || 'Download';
+            notifyTab(pending.tabId, 'success', `Added: ${title}`, item.url);
+            pendingContextMenuAdds.delete(item.url);
+        }
+    });
 }
 
 function notifyActiveTab(status, title, message) {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0] && tabs[0].id) {
-            chrome.tabs.sendMessage(tabs[0].id, {
-                type: 'SHOW_NOTIFICATION',
-                status: status,
-                title: title,
-                message: message
-            }, (response) => {
-                if (chrome.runtime.lastError) {
-                    // Ignore error if content script is not ready or not injectable
-                    // console.log('Notification skipped:', chrome.runtime.lastError.message);
-                }
-            });
+    notifyTab(null, status, title, message);
+}
+
+function notifyTab(tabId, status, title, message) {
+    if (!tabId) {
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            if (tabs[0] && tabs[0].id) {
+                sendNotification(tabs[0].id, status, title, message);
+            }
+        });
+    } else {
+        sendNotification(tabId, status, title, message);
+    }
+}
+
+function sendNotification(tabId, status, title, message) {
+    chrome.tabs.sendMessage(tabId, {
+        type: 'SHOW_NOTIFICATION',
+        status: status,
+        title: title,
+        message: message
+    }, (response) => {
+        if (chrome.runtime.lastError) {
+            // Ignore error if content script is not ready or not injectable
         }
     });
 }
@@ -91,7 +113,87 @@ chrome.runtime.onInstalled.addListener(() => {
             chrome.storage.sync.set({ enableNotifications: false });
         }
     });
+
+    // Create context menu items
+    chrome.contextMenus.create({
+        id: 'add-page-to-metube',
+        title: 'Add To MeTube',
+        contexts: ['page']
+    });
+
+    chrome.contextMenus.create({
+        id: 'add-link-to-metube',
+        title: 'Add Link To MeTube',
+        contexts: ['link']
+    });
 });
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+    let url = '';
+    let pageTitle = tab ? tab.title : '';
+    const tabId = tab ? tab.id : null;
+
+    if (info.menuItemId === 'add-page-to-metube') {
+        url = info.pageUrl;
+    } else if (info.menuItemId === 'add-link-to-metube') {
+        url = info.linkUrl;
+    }
+
+    if (url) {
+        chrome.storage.sync.get([
+            'metubeUrl', 'quality', 'format', 'folder',
+            'autoStart', 'customNamePrefix', 'playlistItemLimit',
+            'splitByChapters', 'chapterTemplate'
+        ], async (settings) => {
+            const metubeUrl = settings.metubeUrl || DEFAULT_METUBE_URL;
+            const options = {
+                url: url,
+                quality: settings.quality || 'best',
+                format: settings.format || 'any',
+                folder: settings.folder || '',
+                auto_start: settings.autoStart !== undefined ? settings.autoStart : true,
+                custom_name_prefix: settings.customNamePrefix || '',
+                playlist_item_limit: settings.playlistItemLimit ? parseInt(settings.playlistItemLimit) : 0,
+                split_by_chapters: settings.splitByChapters || false,
+                chapter_template: settings.chapterTemplate || ''
+            };
+
+            // Immediate "Adding" notification
+            const addingTitle = (info.menuItemId === 'add-page-to-metube' && pageTitle) ? `Adding: ${pageTitle}` : 'Adding to MeTube';
+            notifyTab(tabId, 'info', addingTitle, url);
+
+            // Track this add to show title in success notification later via socket
+            pendingContextMenuAdds.set(url, { tabId: tabId, originalTitle: pageTitle });
+
+            try {
+                const result = await addDownloadToMeTube(metubeUrl, options);
+
+                // If the API response already has a title, we can update the notification immediately
+                // However, often link additions don't have titles yet. 
+                // The socket listener for 'added' will handle it if we don't have it here.
+                if (result && result.title) {
+                    notifyTab(tabId, 'success', `Added: ${result.title}`, url);
+                    pendingContextMenuAdds.delete(url);
+                }
+            } catch (error) {
+                console.error('Failed to add download via context menu:', error);
+                pendingContextMenuAdds.delete(url);
+                notifyTab(tabId, 'error', 'Failed to add to MeTube', `${error.message}\n${url}`);
+            }
+        });
+    }
+});
+
+async function addDownloadToMeTube(baseUrl, options) {
+    const apiUrl = `${baseUrl.replace(/\/$/, '')}/add`;
+    const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(options)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+}
 
 // Re-init socket if settings change
 chrome.storage.onChanged.addListener((changes, namespace) => {

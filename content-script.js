@@ -31,6 +31,10 @@ style.textContent = `
         border-left: 4px solid #22c55e;
     }
 
+    .metube-notification-toast.info {
+        border-left: 4px solid #3b82f6;
+    }
+
     .metube-notification-header {
         font-weight: 600;
         display: flex;
@@ -88,9 +92,15 @@ function showNotification(type, title, message) {
     toast.className = `metube-notification-toast ${type}`;
 
     // Icon based on type
-    const icon = type === 'success'
-        ? `<svg style="width:20px;height:20px;fill:#22c55e;" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>`
-        : `<svg style="width:20px;height:20px;fill:#ef4444;" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>`;
+    let icon = '';
+    if (type === 'success') {
+        icon = `<svg style="width:20px;height:20px;fill:#22c55e;" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>`;
+    } else if (type === 'error') {
+        icon = `<svg style="width:20px;height:20px;fill:#ef4444;" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>`;
+    } else {
+        // Info / Default
+        icon = `<svg style="width:20px;height:20px;fill:#3b82f6;" viewBox="0 0 24 24"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>`;
+    }
 
     toast.innerHTML = `
         <div class="metube-notification-header">
