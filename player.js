@@ -50,6 +50,73 @@ document.addEventListener('DOMContentLoaded', () => {
                 player.on('ready', () => {
                     player.play();
                 });
+
+                // Keyboard Shortcuts
+                document.addEventListener('keydown', (e) => {
+                    // Ignore if typing in an input (just in case)
+                    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
+                        return;
+                    }
+
+                    const key = e.key.toLowerCase();
+
+                    switch (key) {
+                        case 'k':
+                        case ' ':
+                            e.preventDefault();
+                            player.togglePlay();
+                            break;
+                        case 'j':
+                            e.preventDefault();
+                            player.currentTime = Math.max(0, player.currentTime - 10);
+                            break;
+                        case 'l':
+                            e.preventDefault();
+                            player.currentTime = Math.min(player.duration, player.currentTime + 10);
+                            break;
+                        case 'f':
+                            e.preventDefault();
+                            player.fullscreen.toggle();
+                            break;
+                        case 'm':
+                            e.preventDefault();
+                            player.muted = !player.muted;
+                            break;
+                        case 'arrowleft':
+                            e.preventDefault();
+                            player.currentTime = Math.max(0, player.currentTime - 5);
+                            break;
+                        case 'arrowright':
+                            e.preventDefault();
+                            player.currentTime = Math.min(player.duration, player.currentTime + 5);
+                            break;
+                        case 'arrowup':
+                            e.preventDefault();
+                            player.volume = Math.min(1, player.volume + 0.05);
+                            break;
+                        case 'arrowdown':
+                            e.preventDefault();
+                            player.volume = Math.max(0, player.volume - 0.05);
+                            break;
+                        case '<': // Shift + ,
+                            e.preventDefault();
+                            player.speed = Math.max(0.25, player.speed - 0.25);
+                            break;
+                        case '>': // Shift + .
+                            e.preventDefault();
+                            player.speed = Math.min(2, player.speed + 0.25);
+                            break;
+                    }
+
+                    // Seek to 0%-90% with number keys
+                    if (/^\d$/.test(key)) {
+                        e.preventDefault();
+                        const percent = parseInt(key) * 10;
+                        if (!isNaN(player.duration)) {
+                            player.currentTime = (percent / 100) * player.duration;
+                        }
+                    }
+                });
             })
             .catch(err => {
                 console.error('Error checking video:', err);
