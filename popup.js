@@ -74,11 +74,15 @@ const FORMATS = [
         qualities: [{ id: 'best', text: 'Best' }]
     }
 ];
-let socket = null;
 let currentDownloads = new Map();
 let savedSettings = {};
+let visibleLimit = 5;
+let totalDownloads = 0;
+let searchQuery = '';
 
 document.addEventListener('DOMContentLoaded', async () => {
+    scheduleRender(DEFAULT_METUBE_URL);
+
     const defaults = {
         metubeUrl: DEFAULT_METUBE_URL,
         quality: 'best',
@@ -187,6 +191,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         const url = document.getElementById('url-input').value;
         if (!url) return;
 
+        // Adding hides search
+        toggleSearch(false);
+
         const quality = document.getElementById('quality-select').value;
         const format = document.getElementById('format-select').value;
         const folder = document.getElementById('folder-input').value;
@@ -230,10 +237,73 @@ document.addEventListener('DOMContentLoaded', async () => {
     const batchClearBtn = document.getElementById('batch-clear-btn');
 
     batchRetryBtn.addEventListener('click', () => batchRetry(metubeUrl));
-    batchClearBtn.addEventListener('click', () => batchClear(metubeUrl));
+    batchClearBtn.addEventListener('click', () => {
+        batchClear(metubeUrl);
+        toggleSearch(false); // Hide search on clear
+    });
 
-    initSocket(metubeUrl);
+    // Search & Pagination Listeners
+    document.getElementById('search-toggle-btn').addEventListener('click', () => {
+        const container = document.getElementById('search-container');
+        const isHidden = container.style.maxHeight === '0px' || !container.style.maxHeight;
+        toggleSearch(isHidden);
+    });
+
+    document.getElementById('search-input').addEventListener('input', (e) => {
+        searchQuery = e.target.value.toLowerCase();
+        // Reset pagination on search
+        visibleLimit = searchQuery ? 1000 : 5;
+        // If searching, we might need all data?
+        // Ideally search should be server-side too but for now let's just fetch more if needed
+        // or just filter what we have. 
+        // With limited data in popup, local search only searches visible items.
+        // To fix this proper search requires backend support or fetching all IDs.
+        // For now, let's keep it simple: search searches loaded items.
+        // Or improved: if search is active, fetch all (or large chunk)
+        if (searchQuery) {
+            visibleLimit = 100; // fetch more for search
+            getState();
+        } else {
+            visibleLimit = 5;
+            getState();
+        }
+    });
+
+    document.getElementById('show-more-btn').addEventListener('click', () => {
+        visibleLimit += 10;
+        getState();
+    });
+
+    // Initial state fetch
+    getState();
+
+    // Listen for updates from background
+    chrome.runtime.onMessage.addListener((message) => {
+        if (message.type === 'SOCKET_EVENT') {
+            const { eventType, data } = message;
+            handleSocketEvent(eventType, data, metubeUrl);
+        }
+    });
 });
+
+
+
+function toggleSearch(show) {
+    const container = document.getElementById('search-container');
+    const input = document.getElementById('search-input');
+    if (show) {
+        container.style.maxHeight = '50px';
+        container.style.marginBottom = '12px';
+        input.focus();
+    } else {
+        container.style.maxHeight = '0px';
+        container.style.marginBottom = '0px';
+        input.value = '';
+        searchQuery = '';
+        visibleLimit = 5;
+        getState(); // Refresh with default limit
+    }
+}
 
 async function startBatchImport(baseUrl) {
     const text = document.getElementById('import-text').value;
@@ -369,81 +439,82 @@ async function batchClear(baseUrl) {
     }
 }
 
-function initSocket(baseUrl) {
-    if (socket) return;
+function getState() {
+    chrome.runtime.sendMessage({ type: 'GET_STATE', limit: visibleLimit }, (response) => {
+        if (response && response.downloads) {
+            // Merge or Replace? 
+            // Replacing is safer to ensure sync with pagination.
+            // currentDownloads acts as "Visible Downloads" now.
+            currentDownloads = new Map(response.downloads);
+            totalDownloads = response.total || currentDownloads.size;
 
-    const socketUrl = baseUrl.replace(/\/$/, '');
-    socket = io(socketUrl, {
-        path: '/socket.io',
-        transports: ['websocket', 'polling']
+            const metubeUrl = savedSettings.metubeUrl || DEFAULT_METUBE_URL;
+            scheduleRender(metubeUrl);
+
+            const title = document.querySelector('.status-title');
+            if (response.connected) {
+                title.textContent = 'Active Downloads';
+                title.classList.remove('error');
+            } else {
+                title.textContent = 'Disconnected';
+                title.classList.add('error');
+            }
+        }
     });
+}
 
-    socket.on('connect', () => {
-        console.log('Connected');
+function handleSocketEvent(eventType, strdata, baseUrl) {
+    // console.log('Popup received event:', eventType);
+
+    if (eventType === 'connect') {
         const title = document.querySelector('.status-title');
         title.textContent = 'Active Downloads';
         title.classList.remove('error');
-    });
+        return;
+    }
 
-    socket.on('disconnect', () => {
-        console.log('Disconnected');
+    if (eventType === 'disconnect' || eventType === 'connect_error') {
         const title = document.querySelector('.status-title');
-        title.textContent = 'Disconnected';
+        title.textContent = eventType === 'disconnect' ? 'Disconnected' : 'Connection Failed';
         title.classList.add('error');
-    });
+        return;
+    }
 
-    socket.on('connect_error', (err) => {
-        console.error('Socket Error:', err);
-        const title = document.querySelector('.status-title');
-        title.textContent = 'Connection Failed';
-        title.classList.add('error');
-    });
-
-    socket.on('all', (strdata) => {
-        const data = JSON.parse(strdata);
-        currentDownloads.clear();
-
-        const [active, done] = data;
-
-        if (Array.isArray(active)) {
-            active.forEach(([key, item]) => currentDownloads.set(item.url, item));
+    // Data events
+    if (['all', 'added', 'updated', 'completed', 'canceled', 'cleared'].includes(eventType)) {
+        if (eventType === 'all') {
+            // 'all' event is huge, we should probably ignore it and fetch via getState?
+            // Or if we must handle it:
+            // Since 'all' sends everything, parsing it is expensive.
+            // Better to re-fetch state with current limit.
+            getState();
+            return;
+        } else if (eventType === 'added') {
+            // New item should be visible immediately
+            const item = JSON.parse(strdata);
+            currentDownloads.set(item.url, item);
+            totalDownloads++;
+            // If we are strictly paginating, we might have > visibleLimit items now.
+            // renderDownloads handles the slicing so it's fine.
+        } else if (eventType === 'canceled' || eventType === 'cleared') {
+            const url = JSON.parse(strdata);
+            currentDownloads.delete(url);
+            // scheduleRender handles the DOM, but removeElement was used in old code for individual removal.
+            // keeping it simple with scheduleRender is better for consistency, 
+            // but if we want instant removal we can do it here too.
+            // For now, scheduleRender is sufficient and cleaner.
+        } else {
+            // updated, completed
+            const item = JSON.parse(strdata);
+            // Only update if we already have it (it's visible)
+            if (currentDownloads.has(item.url)) {
+                currentDownloads.set(item.url, item);
+            }
+            // If it's completed, it might move down or change status, fine.
         }
-        if (Array.isArray(done)) {
-            done.forEach(([key, item]) => currentDownloads.set(item.url, item));
-        }
 
-        renderDownloads(baseUrl);
-    });
-
-    socket.on('added', (strdata) => {
-        const item = JSON.parse(strdata);
-        currentDownloads.set(item.url, item);
-        renderDownloads(baseUrl);
-    });
-
-    socket.on('updated', (strdata) => {
-        const item = JSON.parse(strdata);
-        currentDownloads.set(item.url, item);
-        updateItemInDom(item, baseUrl);
-    });
-
-    socket.on('completed', (strdata) => {
-        const item = JSON.parse(strdata);
-        currentDownloads.set(item.url, item);
-        renderDownloads(baseUrl); // Full render to move item from active to done section if needed
-    });
-
-    socket.on('canceled', (strdata) => {
-        const url = JSON.parse(strdata);
-        currentDownloads.delete(url);
-        removeElement(url);
-    });
-
-    socket.on('cleared', (strdata) => {
-        const url = JSON.parse(strdata);
-        currentDownloads.delete(url);
-        removeElement(url);
-    });
+        scheduleRender(baseUrl);
+    }
 }
 
 function setLoading(isLoading) {
@@ -464,121 +535,175 @@ async function showToast(message) {
     setTimeout(() => toast.classList.remove('show'), 3000);
 }
 
+let renderScheduled = false;
+
+function scheduleRender(baseUrl) {
+    if (!renderScheduled) {
+        renderScheduled = true;
+        requestAnimationFrame(() => {
+            renderDownloads(baseUrl);
+            renderScheduled = false;
+        });
+    }
+}
+
 function renderDownloads(baseUrl) {
     const list = document.getElementById('downloads-list');
-    const items = Array.from(currentDownloads.values());
+    const showMoreBtn = document.getElementById('show-more-btn');
+
+    // Convert map to array
+    let items = Array.from(currentDownloads.values());
+
+    // Filter by search query
+    if (searchQuery) {
+        items = items.filter(item => {
+            const title = (item.title || item.url || '').toLowerCase();
+            return title.includes(searchQuery);
+        });
+    }
 
     const hasError = items.some(i => i.status === 'error');
     const hasFinishedOrError = items.some(i => i.status === 'finished' || i.status === 'error');
 
-    document.getElementById('batch-retry-btn').style.display = hasError ? 'block' : 'none';
-    document.getElementById('batch-clear-btn').style.display = hasFinishedOrError ? 'block' : 'none';
+    const retryBtn = document.getElementById('batch-retry-btn');
+    const clearBtn = document.getElementById('batch-clear-btn');
+
+    if (retryBtn.style.display !== (hasError ? 'block' : 'none')) {
+        retryBtn.style.display = hasError ? 'block' : 'none';
+    }
+    if (clearBtn.style.display !== (hasFinishedOrError ? 'block' : 'none')) {
+        clearBtn.style.display = hasFinishedOrError ? 'block' : 'none';
+    }
 
     if (items.length === 0) {
-        list.innerHTML = '<div class="empty-state">No active downloads</div>';
+        if (!list.querySelector('.empty-state')) {
+            list.innerHTML = '<div class="empty-state">No active downloads</div>';
+        }
+        showMoreBtn.style.display = 'none';
         return;
     }
 
+    // Sort: purely date descending (latest first)
     items.sort((a, b) => {
-        const scoreA = getStatusScore(a.status);
-        const scoreB = getStatusScore(b.status);
-        if (scoreA !== scoreB) return scoreA - scoreB;
-        return (b.timestamp || 0) - (a.timestamp || 0);
+        const timeA = a.timestamp || 0;
+        const timeB = b.timestamp || 0;
+        return timeB - timeA;
     });
 
+    const totalItems = items.length;
+    const visibleItems = items.slice(0, visibleLimit);
+
+    // Show/Hide "Show More"
+    // totalItems is just what we have locally.
+    // We should use totalDownloads from server.
+    const hasMore = totalDownloads > currentDownloads.size;
+
+    if (hasMore) {
+        if (showMoreBtn.style.display !== 'block') showMoreBtn.style.display = 'block';
+        const remaining = totalDownloads - currentDownloads.size;
+        showMoreBtn.textContent = `Show More (${remaining})`;
+    } else {
+        if (showMoreBtn.style.display !== 'none') showMoreBtn.style.display = 'none';
+    }
+
+    // DOM Diffing / Updating
     const existingCards = list.querySelectorAll('.download-card');
-    const currentUrls = new Set(items.map(i => i.url));
+    const visibleUrls = new Set(visibleItems.map(i => i.url));
+    const visibleSafeIds = new Set(visibleItems.map(i => getSafeId(i.url)));
+
+    // Remove invisible cards
     existingCards.forEach(card => {
         const url = card.dataset.url;
-        if (!currentUrls.has(url)) {
+        if (!visibleUrls.has(url)) {
             card.remove();
         }
     });
 
-    items.forEach((item, index) => {
+    // Remove empty state if present
+    const emptyState = list.querySelector('.empty-state');
+    if (emptyState) emptyState.remove();
+
+    // Render visible
+    visibleItems.forEach((item, index) => {
         const safeId = getSafeId(item.url);
         let card = document.getElementById(`card-${safeId}`);
 
         if (card) {
-            // Update existing card
             updateItemInDom(item, baseUrl);
         } else {
-            // Create new card
             const html = createCardHtml(item);
             const template = document.createElement('div');
             template.innerHTML = html;
             const newCard = template.firstElementChild;
-
-            // Append to list (we'll re-order if necessary, but for now simple append works for new items)
             list.appendChild(newCard);
+            attachCardListeners(newCard, safeId, item, baseUrl);
+            card = newCard;
+        }
 
-            // Attach listeners
-            const actionBtn = document.getElementById(`action-${safeId}`);
-            if (actionBtn) actionBtn.addEventListener('click', () => handleAction(baseUrl, item));
-            const retryBtn = document.getElementById(`retry-${safeId}`);
-            if (retryBtn) retryBtn.addEventListener('click', () => retryDownload(baseUrl, item));
-
-            const playBtn = document.getElementById(`play-${safeId}`);
-            if (playBtn) {
-                playBtn.addEventListener('click', () => {
-                    const videoUrl = getDownloadUrl(item, baseUrl);
-                    const title = item.title || item.filename || 'Video';
-                    const width = Math.round(window.screen.availWidth * 0.85);
-                    const height = Math.round(window.screen.availHeight * 0.85);
-                    const left = Math.round((window.screen.availWidth - width) / 2);
-                    const top = Math.round((window.screen.availHeight - height) / 2);
-
-                    // Robust base64 encoding for Unicode
-                    const b64Url = btoa(unescape(encodeURIComponent(videoUrl)));
-                    const b64Title = btoa(unescape(encodeURIComponent(title)));
-
-                    chrome.windows.create({
-                        url: `player.html?b64_url=${b64Url}&b64_title=${b64Title}`,
-                        type: 'popup',
-                        width: width,
-                        height: height,
-                        left: left,
-                        top: top
-                    });
-                });
-            }
-
-            const downloadBtn = document.getElementById(`download-${safeId}`);
-            if (downloadBtn) {
-                downloadBtn.addEventListener('click', () => {
-                    const url = getDownloadUrl(item, baseUrl);
-                    if (!url) {
-                        showToast('Error: Invalid download URL');
-                        return;
-                    }
-                    chrome.runtime.sendMessage({
-                        type: 'DOWNLOAD_FILE',
-                        url: url
-                    });
-                    showToast('Download started...');
-                });
+        // Reorder if necessary
+        // Optimization: checking children[index] is faster than blindly inserting
+        const currentChildAtIndex = list.children[index];
+        if (currentChildAtIndex !== card) {
+            if (currentChildAtIndex) {
+                list.insertBefore(card, currentChildAtIndex);
+            } else {
+                list.appendChild(card);
             }
         }
     });
+}
 
-    const cardsArray = Array.from(list.querySelectorAll('.download-card'));
-    items.forEach((item, index) => {
-        const safeId = getSafeId(item.url);
-        const card = document.getElementById(`card-${safeId}`);
-        if (card && list.children[index] !== card) {
-            list.insertBefore(card, list.children[index]);
-        }
-    });
+function attachCardListeners(card, safeId, item, baseUrl) {
+    const actionBtn = document.getElementById(`action-${safeId}`);
+    if (actionBtn) actionBtn.addEventListener('click', () => handleAction(baseUrl, item));
 
-    const emptyState = list.querySelector('.empty-state');
-    if (emptyState) emptyState.remove();
+    const retryBtn = document.getElementById(`retry-${safeId}`);
+    if (retryBtn) retryBtn.addEventListener('click', () => retryDownload(baseUrl, item));
+
+    const playBtn = document.getElementById(`play-${safeId}`);
+    if (playBtn) {
+        playBtn.addEventListener('click', () => {
+            const videoUrl = getDownloadUrl(item, baseUrl);
+            const title = item.title || item.filename || 'Video';
+            const width = Math.round(window.screen.availWidth * 0.85);
+            const height = Math.round(window.screen.availHeight * 0.85);
+            const left = Math.round((window.screen.availWidth - width) / 2);
+            const top = Math.round((window.screen.availHeight - height) / 2);
+
+            const b64Url = btoa(unescape(encodeURIComponent(videoUrl)));
+            const b64Title = btoa(unescape(encodeURIComponent(title)));
+
+            chrome.windows.create({
+                url: `player.html?b64_url=${b64Url}&b64_title=${b64Title}`,
+                type: 'popup',
+                width: width,
+                height: height,
+                left: left,
+                top: top
+            });
+        });
+    }
+
+    const downloadBtn = document.getElementById(`download-${safeId}`);
+    if (downloadBtn) {
+        downloadBtn.addEventListener('click', () => {
+            const url = getDownloadUrl(item, baseUrl);
+            if (!url) {
+                showToast('Error: Invalid download URL');
+                return;
+            }
+            chrome.runtime.sendMessage({
+                type: 'DOWNLOAD_FILE',
+                url: url
+            });
+            showToast('Download started...');
+        });
+    }
 }
 
 function getSafeId(url) {
     return btoa(url).replace(/[^a-zA-Z0-9]/g, '');
 }
-
-
 
 function getStatusScore(status) {
     if (status === 'downloading') return 1;
@@ -762,55 +887,11 @@ function updateItemInDom(item, baseUrl) {
                 `;
 
                 // Re-bind listeners
-                const newBtn = document.getElementById(`action-${safeId}`);
-                if (newBtn) newBtn.addEventListener('click', () => handleAction(baseUrl, item));
-                const newRetry = document.getElementById(`retry-${safeId}`);
-                if (newRetry) newRetry.addEventListener('click', () => retryDownload(baseUrl, item));
-
-                const playBtn = document.getElementById(`play-${safeId}`);
-                if (playBtn) {
-                    playBtn.addEventListener('click', () => {
-                        const videoUrl = getDownloadUrl(item, baseUrl);
-                        const title = item.title || item.filename || 'Video';
-                        const width = Math.round(window.screen.availWidth * 0.85);
-                        const height = Math.round(window.screen.availHeight * 0.85);
-                        const left = Math.round((window.screen.availWidth - width) / 2);
-                        const top = Math.round((window.screen.availHeight - height) / 2);
-
-                        chrome.windows.create({
-                            url: `player.html?url=${encodeURIComponent(videoUrl)}&title=${encodeURIComponent(title)}`,
-                            type: 'popup',
-                            width: width,
-                            height: height,
-                            left: left,
-                            top: top
-                        });
-                    });
-                }
-
-                const downloadBtn = document.getElementById(`download-${safeId}`);
-                if (downloadBtn) {
-                    downloadBtn.addEventListener('click', () => {
-                        const url = getDownloadUrl(item, baseUrl);
-                        // console.log('Attempting download:', url, 'Filename:', item.filename);
-                        if (!url) {
-                            showToast('Error: Invalid download URL');
-                            return;
-                        }
-                        chrome.downloads.download({
-                            url: url,
-                            // filename: item.filename, // Removed to prevent crashes
-                            saveAs: false
-                        }, (downloadId) => {
-                            if (chrome.runtime.lastError) {
-                                console.error('Download failed:', chrome.runtime.lastError);
-                                showToast('Download failed: ' + chrome.runtime.lastError.message);
-                            } else {
-                                // console.log('Download started, ID:', downloadId);
-                            }
-                        });
-                    });
-                }
+                // We reuse attachCardListeners but we need the card element
+                // attachCardListeners expects the card element to find the buttons inside it.
+                // Since we just updated internal HTML of footerControls which is inside card,
+                // we can just pass the card.
+                attachCardListeners(card, safeId, item, baseUrl);
             }
         }
     }

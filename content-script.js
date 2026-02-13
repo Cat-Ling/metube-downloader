@@ -42,11 +42,18 @@ const NOTIFICATION_CSS = `
         gap: 8px;
     }
 
-    .metube-notification-header span {
+    .metube-notification-header .metube-title {
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
         flex: 1;
+        text-align: left;
+    }
+
+    .metube-notification-header .metube-icon-container {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
     }
 
     .metube-notification-body {

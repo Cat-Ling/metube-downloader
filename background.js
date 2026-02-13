@@ -2,6 +2,17 @@ importScripts('lib/socket.io.min.js');
 
 const DEFAULT_METUBE_URL = 'http://localhost:8081';
 let socket = null;
+let currentDownloads = new Map();
+
+function broadcastEvent(type, data) {
+    chrome.runtime.sendMessage({
+        type: 'SOCKET_EVENT',
+        eventType: type,
+        data: data
+    }).catch(err => {
+        // Popeup closed, ignore
+    });
+}
 
 // URL Normalization for better matching
 function normalizeUrl(url) {
@@ -76,30 +87,33 @@ function initSocket(url) {
 
     socket.on('connect', () => {
         console.log('[MeTube] Background connected');
+        broadcastEvent('connect');
     });
 
-    socket.on('completed', (strdata) => {
-        const item = JSON.parse(strdata);
-        console.log('[MeTube] Download completed:', item.title || item.url);
-        const title = item.title || item.url || 'Download';
-        notifyActiveTab('success', 'Download Complete', title);
+    socket.on('disconnect', () => {
+        console.log('[MeTube] Background disconnected');
+        broadcastEvent('disconnect');
     });
 
-    socket.on('error', (strdata) => {
-        console.error('[MeTube] Socket error event:', strdata);
+    socket.on('connect_error', (err) => {
+        console.error('[MeTube] Socket Error:', err);
+        broadcastEvent('connect_error', err);
     });
 
-    socket.on('updated', (strdata) => {
-        const item = JSON.parse(strdata);
-        if (item.status === 'error') {
-            console.error('[MeTube] Download failed:', item.title || item.url, item.msg);
-            const title = item.title || item.url || 'Download';
-            notifyActiveTab('error', 'Download Failed', `${title}: ${item.msg || 'Unknown error'}`);
-        }
+    socket.on('all', (strdata) => {
+        const data = JSON.parse(strdata);
+        currentDownloads.clear();
+        const [active, done] = data;
+        if (Array.isArray(active)) active.forEach(([key, item]) => currentDownloads.set(item.url, item));
+        if (Array.isArray(done)) done.forEach(([key, item]) => currentDownloads.set(item.url, item));
+        broadcastEvent('all', strdata);
     });
 
     socket.on('added', async (strdata) => {
         const item = JSON.parse(strdata);
+        currentDownloads.set(item.url, item);
+        broadcastEvent('added', strdata);
+
         const urlToMatch = item.original_url || item.url;
         console.log('[MeTube] Item added event:', urlToMatch);
 
@@ -112,6 +126,45 @@ function initSocket(url) {
         } else {
             console.log('[MeTube] No pending add found for:', urlToMatch, '- possibly added via popup.');
         }
+    });
+
+    socket.on('updated', (strdata) => {
+        const item = JSON.parse(strdata);
+        currentDownloads.set(item.url, item);
+        broadcastEvent('updated', strdata);
+
+        if (item.status === 'error') {
+            console.error('[MeTube] Download failed:', item.title || item.url, item.msg);
+            const title = item.title || item.url || 'Download';
+            notifyActiveTab('error', 'Download Failed', `${title}: ${item.msg || 'Unknown error'}`);
+        }
+    });
+
+    socket.on('completed', (strdata) => {
+        const item = JSON.parse(strdata);
+        currentDownloads.set(item.url, item);
+        broadcastEvent('completed', strdata);
+
+        console.log('[MeTube] Download completed:', item.title || item.url);
+        const title = item.title || item.url || 'Download';
+        notifyActiveTab('success', 'Download Complete', title);
+    });
+
+    socket.on('canceled', (strdata) => {
+        const url = JSON.parse(strdata);
+        currentDownloads.delete(url);
+        broadcastEvent('canceled', strdata);
+    });
+
+    socket.on('cleared', (strdata) => {
+        const url = JSON.parse(strdata);
+        currentDownloads.delete(url);
+        broadcastEvent('cleared', strdata);
+    });
+
+    socket.on('error', (strdata) => {
+        console.error('[MeTube] Socket error event:', strdata);
+        broadcastEvent('error', strdata);
     });
 }
 
@@ -294,5 +347,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 console.error('Background download failed:', chrome.runtime.lastError);
             }
         });
+    } else if (message.type === 'GET_STATE') {
+        // Send current state to popup with pagination
+        const limit = message.limit || 50; // Default to a reasonable chunk if not specified
+        const offset = message.offset || 0;
+
+        let items = Array.from(currentDownloads.values());
+        // Sort by timestamp descending (latest first)
+        items.sort((a, b) => {
+            const timeA = a.timestamp || 0;
+            const timeB = b.timestamp || 0;
+            return timeB - timeA;
+        });
+
+        const total = items.length;
+        const slice = items.slice(offset, offset + limit);
+
+        sendResponse({
+            downloads: slice.map(i => [i.url, i]), // Map format [[k,v], [k,v]]
+            connected: socket && socket.connected,
+            total: total
+        });
     }
+    return true; // Keep channel open for sendResponse
 });
