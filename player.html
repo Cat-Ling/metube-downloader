@@ -7,42 +7,162 @@
     <title>MeTube Player</title>
     <link rel="stylesheet" href="lib/plyr.css" />
     <style>
+        :root {
+            /* Dark Mode Defaults */
+            --bg-color: #0f172a;
+            --text-main: #f8fafc;
+            --accent: #8b5cf6;
+            --plyr-color-main: var(--accent);
+            --plyr-video-controls-background: transparent;
+            --plyr-menu-background: #1e293b;
+            --plyr-menu-color: #f1f5f9;
+            --plyr-menu-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            --plyr-menu-item-color-active: var(--accent);
+            --plyr-range-thumb-height: 14px;
+            --plyr-range-track-height: 6px;
+        }
+
+        @media (prefers-color-scheme: light) {
+            :root {
+                --bg-color: #f1f5f9;
+                --text-main: #0f172a;
+                --plyr-video-controls-background: transparent;
+                --plyr-video-control-color: #475569;
+                --plyr-menu-background: #ffffff;
+                --plyr-menu-color: #1e293b;
+                --plyr-menu-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            }
+        }
+
         body {
             margin: 0;
-            background: #000;
+            padding: 0;
+            background: var(--bg-color);
+            color: var(--text-main);
             height: 100vh;
             width: 100vw;
             overflow: hidden;
-        }
-
-        .container {
-            width: 100%;
-            height: 100%;
-            max-width: none;
+            transition: background 0.3s ease;
             display: flex;
             align-items: center;
             justify-content: center;
         }
 
+        .container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
         .plyr {
             width: 100%;
             height: 100%;
+            z-index: 10;
         }
 
+        /* Audio mode tweaks */
+        /* We remove the position: absolute and height: auto that were crushing the player */
+        
+        body.audio-mode .plyr,
+        body.audio-mode .plyr--video,
+        body.audio-mode .plyr__video-wrapper,
+        body.audio-mode .plyr__poster {
+            background: transparent !important;
+        }
+        
+        /* Ensure the video element inside Plyr doesn't cover our art */
+        body.audio-mode video {
+            background: transparent !important;
+            opacity: 0 !important;
+        }
+
+        /* Standard video styling */
         video {
             width: 100%;
             height: 100%;
             object-fit: contain;
         }
+
+        #poster-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        #poster-img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            filter: blur(40px) brightness(0.4);
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        .art-content {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 2.5rem;
+            box-sizing: border-box;
+            text-align: center;
+        }
+
+        #main-poster {
+            max-width: 250px;
+            width: 70%;
+            aspect-ratio: 1/1;
+            object-fit: cover;
+            border-radius: 16px;
+            box-shadow: 0 15px 45px rgba(0, 0, 0, 0.6);
+            margin-bottom: 2rem;
+        }
+
+        #media-title {
+            color: #fff; /* Always white for readability on blurred bg */
+            font-family: sans-serif;
+            margin: 0;
+            font-size: 1.1rem;
+            font-weight: 600;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
     </style>
 </head>
 
 <body>
-    <div class="container">
-        <div id="error-message" style="display: none; color: white; text-align: center; font-family: sans-serif;">
-            <h2 style="margin-bottom: 10px;">Video Not Found (404)</h2>
+    <div class="container" id="player-container">
+        <div id="error-message" style="display: none; color: white; text-align: center; font-family: sans-serif; padding: 20px; z-index: 20;">
+            <h2 style="margin-bottom: 10px;">Media Not Found (404)</h2>
             <p>The file may have been deleted or moved on the server.</p>
         </div>
+        
+        <div id="poster-container" style="display: none;">
+            <img id="poster-img">
+            <div class="art-content">
+                <img id="main-poster">
+                <h2 id="media-title"></h2>
+            </div>
+        </div>
+
         <video id="player" playsinline controls>
             <source src="" type="video/mp4" />
         </video>

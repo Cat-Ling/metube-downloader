@@ -6,6 +6,7 @@
   "permissions": [
     "storage",
     "activeTab",
+    "cookies",
     "downloads",
     "alarms",
     "contextMenus"

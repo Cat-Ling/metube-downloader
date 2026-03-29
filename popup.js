@@ -1,6 +1,10 @@
 
 const DEFAULT_METUBE_URL = 'http://localhost:8081';
 
+function getMetubeUrl() {
+    return (savedSettings.metubeUrl || DEFAULT_METUBE_URL).replace(/\/$/, '');
+}
+
 const FORMATS = [
     {
         id: 'any',
@@ -77,6 +81,7 @@ const FORMATS = [
 let currentDownloads = new Map();
 let savedSettings = {};
 let visibleLimit = 5;
+const speedHistory = new Map(); // Store last X samples for smoothing
 let totalDownloads = 0;
 let searchQuery = '';
 
@@ -92,13 +97,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         playlistItemLimit: '',
         autoStart: true,
         splitByChapters: false,
-        chapterTemplate: ''
+        chapterTemplate: '',
+        cookieUpload: false
     };
 
     const settings = await chrome.storage.sync.get(Object.keys(defaults));
     savedSettings = { ...defaults, ...settings };
 
-    const metubeUrl = savedSettings.metubeUrl;
+    updateCookieStatus(getMetubeUrl());
 
     document.getElementById('folder-input').value = savedSettings.folder;
     document.getElementById('prefix-input').value = savedSettings.customNamePrefix;
@@ -106,13 +112,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('autostart-check').checked = savedSettings.autoStart;
     document.getElementById('chapters-check').checked = savedSettings.splitByChapters;
     document.getElementById('chapter-template').value = savedSettings.chapterTemplate;
-
-    document.getElementById('chapter-template-container').style.display = savedSettings.splitByChapters ? 'block' : 'none';
-
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.url) {
         document.getElementById('url-input').value = tab.url;
     }
+
+    document.getElementById('chapter-template-container').style.display = savedSettings.splitByChapters ? 'block' : 'none';
 
     populateFormats(savedSettings.format);
     populateQualities(savedSettings.format, savedSettings.quality);
@@ -144,7 +149,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
             if (isMobile) {
-                chrome.tabs.create({ url: metubeUrl });
+                chrome.tabs.create({ url: getMetubeUrl() });
             } else {
                 const width = Math.round(window.screen.availWidth * 0.85);
                 const height = Math.round(window.screen.availHeight * 0.85);
@@ -152,7 +157,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const top = Math.round((window.screen.availHeight - height) / 2);
 
                 chrome.windows.create({
-                    url: metubeUrl,
+                    url: getMetubeUrl(),
                     type: 'popup',
                     width: width,
                     height: height,
@@ -171,15 +176,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     document.getElementById('tool-import').addEventListener('click', openImportModal);
-    document.getElementById('tool-export').addEventListener('click', () => exportUrls(metubeUrl));
-    document.getElementById('tool-copy').addEventListener('click', () => copyUrls(metubeUrl));
+    document.getElementById('tool-export').addEventListener('click', () => exportUrls(getMetubeUrl()));
+    document.getElementById('tool-copy').addEventListener('click', () => copyUrls(getMetubeUrl()));
 
     const importModal = document.getElementById('import-modal');
     document.getElementById('import-cancel').addEventListener('click', () => {
         importModal.style.display = 'none';
         document.getElementById('import-text').value = '';
     });
-    document.getElementById('import-confirm').addEventListener('click', () => startBatchImport(metubeUrl));
+    document.getElementById('import-confirm').addEventListener('click', () => startBatchImport(getMetubeUrl()));
 
     function openImportModal() {
         importModal.style.display = 'flex';
@@ -204,26 +209,33 @@ document.addEventListener('DOMContentLoaded', async () => {
         const chapterTemplate = document.getElementById('chapter-template').value;
 
         if (splitChapters && !chapterTemplate.includes('%(section_number)')) {
-            showToast('Chapter template must include %(section_number)');
+            showToast('Chapter template must include %(section_number)', 'error');
             return;
         }
 
-        const options = {
-            url: url,
-            quality: quality,
-            format: format,
-            folder: folder,
-            custom_name_prefix: prefix,
-            playlist_item_limit: limit ? parseInt(limit) : 0,
-            auto_start: autoStart,
-            split_by_chapters: splitChapters,
-            chapter_template: chapterTemplate
-        };
-
         setLoading(true);
         try {
-            await addDownload(metubeUrl, options);
-            showToast('Download Added!');
+            const task = {
+                baseUrl: getMetubeUrl(),
+                options: {
+                    url: url,
+                    quality: quality,
+                    format: format,
+                    codec: 'auto',
+                    folder: folder,
+                    custom_name_prefix: prefix,
+                    playlist_item_limit: limit ? parseInt(limit) : 0,
+                    auto_start: autoStart,
+                    split_by_chapters: splitChapters,
+                    chapter_template: chapterTemplate
+                },
+                cookieUpload: false, // Now manual via dedicated buttons
+                tabId: tab ? tab.id : null,
+                title: '' 
+            };
+
+            await chrome.runtime.sendMessage({ type: 'QUEUE_DOWNLOAD', task: task });
+            showToast('Added to Queue');
             document.getElementById('url-input').value = '';
         } catch (error) {
             const msg = error.message === 'Failed to fetch' ? 'Could not connect to MeTube server' : error.message;
@@ -236,10 +248,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     const batchRetryBtn = document.getElementById('batch-retry-btn');
     const batchClearBtn = document.getElementById('batch-clear-btn');
 
-    batchRetryBtn.addEventListener('click', () => batchRetry(metubeUrl));
+    batchRetryBtn.addEventListener('click', () => batchRetry(getMetubeUrl()));
     batchClearBtn.addEventListener('click', () => {
-        batchClear(metubeUrl);
-        toggleSearch(false); // Hide search on clear
+        document.getElementById('clear-modal').style.display = 'flex';
+        toggleSearch(false);
+    });
+
+    document.getElementById('clear-cancel').addEventListener('click', () => {
+        document.getElementById('clear-modal').style.display = 'none';
+    });
+
+    document.getElementById('clear-failed-btn').addEventListener('click', () => {
+        batchClear(getMetubeUrl(), 'error');
+        document.getElementById('clear-modal').style.display = 'none';
+    });
+
+    document.getElementById('clear-completed-btn').addEventListener('click', () => {
+        batchClear(getMetubeUrl(), 'finished');
+        document.getElementById('clear-modal').style.display = 'none';
+    });
+
+    document.getElementById('clear-all-btn').addEventListener('click', () => {
+        batchClear(getMetubeUrl(), 'all');
+        document.getElementById('clear-modal').style.display = 'none';
     });
 
     // Search & Pagination Listeners
@@ -277,14 +308,122 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Initial state fetch
     getState();
 
+    // Cookie Management Listeners
+    document.getElementById('upload-site-cookies-btn').addEventListener('click', async () => {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab || !tab.url) {
+            showToast('No active tab found');
+            return;
+        }
+        
+        showToast('Extracting & uploading site cookies...');
+        chrome.runtime.sendMessage({ 
+            type: 'UPLOAD_SITE_COOKIES', 
+            url: tab.url, 
+            baseUrl: getMetubeUrl() 
+        }, (result) => {
+            if (result && result.success) {
+                showToast('Site cookies uploaded successfully', 'success');
+                updateCookieStatus(getMetubeUrl());
+            } else {
+                showToast('Failed: ' + (result ? result.msg : 'Unknown error'), 'error');
+            }
+        });
+    });
+    const cookieFileInput = document.getElementById('cookie-file-input');
+
+    cookieFileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        showToast('Uploading local cookie file...');
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            const text = event.target.result;
+            chrome.runtime.sendMessage({ 
+                type: 'UPLOAD_RAW_COOKIES', 
+                text: text, 
+                baseUrl: getMetubeUrl() 
+            }, (result) => {
+                if (result && result.success) {
+                    showToast('Cookie file uploaded', 'success');
+                    updateCookieStatus(getMetubeUrl());
+                } else {
+                    showToast('Upload failed: ' + (result ? result.msg : 'Unknown error'), 'error');
+                }
+                cookieFileInput.value = ''; // Reset
+            });
+        };
+        reader.readAsText(file);
+    });
+
+    document.getElementById('delete-cookies-btn').addEventListener('click', () => {
+        document.getElementById('cookie-confirm-modal').style.display = 'flex';
+    });
+
+    document.getElementById('cookie-confirm-cancel').addEventListener('click', () => {
+        document.getElementById('cookie-confirm-modal').style.display = 'none';
+    });
+
+    document.getElementById('cookie-confirm-delete-btn').addEventListener('click', () => {
+        document.getElementById('cookie-confirm-modal').style.display = 'none';
+        setLoading(true);
+        chrome.runtime.sendMessage({ 
+            type: 'DELETE_COOKIES', 
+            baseUrl: getMetubeUrl() 
+        }, (result) => {
+            setLoading(false);
+            if (result && result.success) {
+                showToast('Cookies deleted from server', 'success');
+                updateCookieStatus(getMetubeUrl());
+            } else {
+                showToast('Delete failed: ' + (result ? result.msg : 'Unknown error'), 'error');
+            }
+        });
+    });
+
     // Listen for updates from background
     chrome.runtime.onMessage.addListener((message) => {
         if (message.type === 'SOCKET_EVENT') {
             const { eventType, data } = message;
-            handleSocketEvent(eventType, data, metubeUrl);
+            handleSocketEvent(eventType, data, getMetubeUrl());
         }
     });
+
+    // Refresh cookie status periodically while popup is open
+    const statusInterval = setInterval(() => updateCookieStatus(getMetubeUrl()), 5000);
+    window.addEventListener('unload', () => clearInterval(statusInterval));
 });
+
+function updateCookieStatus(baseUrl) {
+    chrome.runtime.sendMessage({ type: 'GET_COOKIE_STATUS', baseUrl: baseUrl }, (response) => {
+        const icon = document.getElementById('cookie-status-icon');
+        const statusText = document.getElementById('cookie-status-text');
+        const delBtn = document.getElementById('delete-cookies-btn');
+        const siteBtnText = document.getElementById('upload-site-cookies-text');
+        const fileBtnText = document.getElementById('upload-cookie-file-text');
+
+        if (response && response.success) {
+            if (response.has_cookies) {
+                icon.innerHTML = '<svg class="icon" viewBox="0 0 24 24" style="fill: var(--success);"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>';
+                statusText.textContent = 'Cookies active on server';
+                statusText.style.color = 'var(--success)';
+                delBtn.style.display = 'block';
+                
+                if (siteBtnText) siteBtnText.textContent = 'Replace Site';
+                if (fileBtnText) fileBtnText.textContent = 'Replace File';
+            } else {
+                icon.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>';
+                statusText.textContent = 'No cookies configured';
+                statusText.style.color = 'var(--text-muted)';
+                delBtn.style.display = 'none';
+
+                if (siteBtnText) siteBtnText.textContent = 'Site Cookies';
+                if (fileBtnText) fileBtnText.textContent = 'Local File';
+            }
+        }
+    });
+}
 
 
 
@@ -330,25 +469,28 @@ async function startBatchImport(baseUrl) {
     showToast(`Importing ${urls.length} URLs...`);
 
     for (const url of urls) {
-        try {
-            await addDownload(baseUrl, {
+        const task = {
+            baseUrl: baseUrl,
+            options: {
                 url: url,
                 quality: quality,
                 format: format,
+                codec: 'auto',
                 folder: folder,
                 custom_name_prefix: prefix,
                 playlist_item_limit: limit ? parseInt(limit) : 0,
                 auto_start: autoStart,
                 split_by_chapters: splitChapters,
                 chapter_template: chapterTemplate
-            });
-        } catch (e) {
-            console.error('Import error', e);
-            const msg = e.message === 'Failed to fetch' ? 'Connection failed' : e.message;
-            showToast(`Error: ${msg}`);
-        }
+            },
+            cookieUpload: false, // Batch import usually doesn't need per-tab cookies? 
+            // Or maybe it should use current tab cookies for all? 
+            // For now false to avoid confusion.
+            tabId: null
+        };
+        await chrome.runtime.sendMessage({ type: 'QUEUE_DOWNLOAD', task: task });
     }
-    showToast('Batch import finished');
+    showToast('Batch import queued');
 }
 
 function getVisibleUrls() {
@@ -384,59 +526,104 @@ function copyUrls(baseUrl) {
 }
 
 async function batchRetry(baseUrl) {
-    const failedItems = Array.from(currentDownloads.values()).filter(i => i.status === 'error');
-    if (failedItems.length === 0) return;
-
-    setLoading(true);
-    try {
-        const ids = failedItems.map(i => i.url);
-        await fetch(`${baseUrl.replace(/\/$/, '')}/delete`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids: ids, where: 'done' })
-        });
-
-        for (const item of failedItems) {
-            await addDownload(baseUrl, {
-                url: item.url,
-                quality: item.quality,
-                format: item.format,
-                folder: item.folder,
-                custom_name_prefix: item.custom_name_prefix,
-                playlist_item_limit: item.playlist_item_limit || 0,
-                split_by_chapters: item.split_by_chapters,
-                auto_start: true
-            });
+    chrome.runtime.sendMessage({ type: 'GET_STATE', limit: 999 }, async (response) => {
+        if (!response || !response.downloads) return;
+        
+        const failedItems = response.downloads.map(d => d[1]).filter(i => i.status === 'error');
+        if (failedItems.length === 0) {
+            showToast('No failed items to retry');
+            return;
         }
-        showToast(`Retrying ${failedItems.length} downloads...`);
-    } catch (e) {
-        console.error(e);
-        const msg = e.message === 'Failed to fetch' ? 'Connection failed' : 'Batch retry failed';
-        showToast(msg);
-    } finally {
-        setLoading(false);
-    }
+
+        setLoading(true);
+        try {
+            const ids = failedItems.map(i => i.url);
+            // Clear from server's failed list
+            await fetch(`${baseUrl.replace(/\/$/, '')}/delete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids: ids, where: 'done' })
+            });
+
+            // Re-enqueue all failed tasks
+            for (const item of failedItems) {
+                const task = {
+                    baseUrl: baseUrl,
+                    options: {
+                        url: item.url,
+                        quality: item.quality,
+                        format: item.format,
+                        codec: 'auto',
+                        folder: item.folder,
+                        custom_name_prefix: item.custom_name_prefix,
+                        playlist_item_limit: item.playlist_item_limit || 0,
+                        split_by_chapters: item.split_by_chapters,
+                        auto_start: true
+                    },
+                    cookieUpload: false,
+                    tabId: null
+                };
+                chrome.runtime.sendMessage({ type: 'QUEUE_DOWNLOAD', task: task });
+            }
+            showToast(`Retrying ${failedItems.length} downloads...`, 'info');
+        } catch (e) {
+            console.error('Batch retry failed', e);
+            showToast('Batch retry failed', 'error');
+        } finally {
+            setLoading(false);
+        }
+    });
 }
 
-async function batchClear(baseUrl) {
-    const targets = Array.from(currentDownloads.values())
-        .filter(i => i.status === 'finished' || i.status === 'error');
+async function batchClear(baseUrl, typeFilter = 'all') {
+    // We must fetch ALL items from background first, 
+    // because currentDownloads is paginated/limited.
+    chrome.runtime.sendMessage({ type: 'GET_STATE', limit: 999 }, async (response) => {
+        if (!response || !response.downloads) return;
+        
+        const allItems = response.downloads.map(d => d[1]);
+        let targets = [];
+        
+        if (typeFilter === 'error') {
+            targets = allItems.filter(i => i.status === 'error');
+        } else if (typeFilter === 'finished') {
+            targets = allItems.filter(i => i.status === 'finished');
+        } else {
+            // all completed/failed
+            targets = allItems.filter(i => i.status === 'finished' || i.status === 'error');
+        }
 
-    if (targets.length === 0) return;
+        if (targets.length === 0) {
+            let msg = 'Nothing to clear';
+            if (typeFilter === 'error') msg = 'No failed downloads to clear';
+            else if (typeFilter === 'finished') msg = 'No completed downloads to clear';
+            showToast(msg, 'info');
+            return;
+        }
 
-    const ids = targets.map(i => i.url);
-    try {
-        await fetch(`${baseUrl.replace(/\/$/, '')}/delete`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids: ids, where: 'done' })
-        });
-        showToast(`Cleared ${targets.length} downloads.`);
-    } catch (e) {
-        console.error(e);
-        const msg = e.message === 'Failed to fetch' ? 'Connection failed' : 'Batch clear failed';
-        showToast(msg);
-    }
+        const ids = targets.map(i => i.url);
+        try {
+            const res = await fetch(`${baseUrl.replace(/\/$/, '')}/delete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids: ids, where: 'done' })
+            });
+            if (res.ok) {
+                let successMsg = `Cleared ${targets.length} downloads`;
+                if (typeFilter === 'error') successMsg = `Cleared ${targets.length} failed downloads`;
+                else if (typeFilter === 'finished') successMsg = `Cleared ${targets.length} completed downloads`;
+                
+                showToast(successMsg, 'success');
+                // State will auto-update via socket, but we can refresh manually too
+                getState();
+            } else {
+                showToast('Server error during clear', 'error');
+            }
+        } catch (e) {
+            console.error('Batch clear failed', e);
+            showToast('Connection failed during clear', 'error');
+        }
+    });
 }
 
 function getState() {
@@ -448,8 +635,7 @@ function getState() {
             currentDownloads = new Map(response.downloads);
             totalDownloads = response.total || currentDownloads.size;
 
-            const metubeUrl = savedSettings.metubeUrl || DEFAULT_METUBE_URL;
-            scheduleRender(metubeUrl);
+            scheduleRender(getMetubeUrl());
 
             const title = document.querySelector('.status-title');
             if (response.connected) {
@@ -525,13 +711,16 @@ function setLoading(isLoading) {
         `<svg class="icon" viewBox="0 0 24 24"><path d="M19,9h-4V3H9v6H5l7,7L19,9z M5,18v2h14v-2H5z"/></svg> Add To MeTube`;
 }
 
-async function showToast(message) {
+async function showToast(message, type = 'info') {
     const settings = await chrome.storage.sync.get(['enableNotifications']);
     if (settings.enableNotifications === false) return;
 
     const toast = document.getElementById('toast');
     toast.textContent = message;
-    toast.classList.add('show');
+    
+    // Reset classes and add new ones
+    toast.className = 'toast show ' + type;
+    
     setTimeout(() => toast.classList.remove('show'), 3000);
 }
 
@@ -655,26 +844,39 @@ function renderDownloads(baseUrl) {
 
 function attachCardListeners(card, safeId, item, baseUrl) {
     const actionBtn = document.getElementById(`action-${safeId}`);
-    if (actionBtn) actionBtn.addEventListener('click', () => handleAction(baseUrl, item));
+    if (actionBtn) actionBtn.addEventListener('click', () => {
+        const latest = currentDownloads.get(item.url) || item;
+        handleAction(baseUrl, latest);
+    });
 
     const retryBtn = document.getElementById(`retry-${safeId}`);
-    if (retryBtn) retryBtn.addEventListener('click', () => retryDownload(baseUrl, item));
+    if (retryBtn) retryBtn.addEventListener('click', () => {
+        const latest = currentDownloads.get(item.url) || item;
+        retryDownload(baseUrl, latest);
+    });
 
     const playBtn = document.getElementById(`play-${safeId}`);
     if (playBtn) {
         playBtn.addEventListener('click', () => {
-            const videoUrl = getDownloadUrl(item, baseUrl);
-            const title = item.title || item.filename || 'Video';
-            const width = Math.round(window.screen.availWidth * 0.85);
-            const height = Math.round(window.screen.availHeight * 0.85);
+            const latest = currentDownloads.get(item.url) || item;
+            const videoUrl = getDownloadUrl(latest, baseUrl);
+            const title = latest.title || latest.filename || 'Media';
+            const isAudio = isAudioType(latest);
+            
+            const width = isAudio ? 400 : Math.round(window.screen.availWidth * 0.85);
+            const height = isAudio ? 500 : Math.round(window.screen.availHeight * 0.85);
             const left = Math.round((window.screen.availWidth - width) / 2);
             const top = Math.round((window.screen.availHeight - height) / 2);
 
             const b64Url = btoa(unescape(encodeURIComponent(videoUrl)));
             const b64Title = btoa(unescape(encodeURIComponent(title)));
+            const b64Type = btoa(unescape(encodeURIComponent(latest.download_type || (isAudio ? 'audio' : 'video'))));
+            
+            const thumbnail = latest.thumbnail || (latest.entry && latest.entry.thumbnail) || '';
+            const b64Poster = thumbnail ? btoa(unescape(encodeURIComponent(thumbnail))) : '';
 
             chrome.windows.create({
-                url: `player.html?b64_url=${b64Url}&b64_title=${b64Title}`,
+                url: `player.html?b64_url=${encodeURIComponent(b64Url)}&b64_title=${encodeURIComponent(b64Title)}&b64_type=${encodeURIComponent(b64Type)}${b64Poster ? '&b64_poster=' + encodeURIComponent(b64Poster) : ''}`,
                 type: 'popup',
                 width: width,
                 height: height,
@@ -687,7 +889,8 @@ function attachCardListeners(card, safeId, item, baseUrl) {
     const downloadBtn = document.getElementById(`download-${safeId}`);
     if (downloadBtn) {
         downloadBtn.addEventListener('click', () => {
-            const url = getDownloadUrl(item, baseUrl);
+            const latest = currentDownloads.get(item.url) || item;
+            const url = getDownloadUrl(latest, baseUrl);
             if (!url) {
                 showToast('Error: Invalid download URL');
                 return;
@@ -713,33 +916,8 @@ function getStatusScore(status) {
     return 5; // finished
 }
 
-function getDownloadUrl(item, baseUrl) {
-    // Logic from Metube UI
-    let base = baseUrl;
-    // Remove potential trailing slash from baseUrl
-    base = base.replace(/\/$/, '');
-
-    // Check if it's audio (simplified logic, ideally checks quality/format)
-    // For now assuming standard download dir. 
-    // If strict audio separation is needed we'd need config.
-    // Defaulting to standard download path structure:
-    let path = '/download/';
-
-    if (item.folder) {
-        path += item.folder + '/';
-    }
-
-    return base + path + encodeURIComponent(item.filename);
-}
-
-function createCardHtml(item) {
-    const safeId = getSafeId(item.url);
-    const statusClass = normalizeStatus(item.status);
-    const percent = getPercent(item);
-    const title = item.title || item.url || 'Unknown Video';
+function getFooterHtml(item, safeId) {
     const isError = item.status === 'error';
-    const msg = item.msg || '';
-
     const isActive = ['pending', 'preparing', 'downloading'].includes(item.status);
     const actionIcon = isActive
         ? `<svg class="icon" viewBox="0 0 24 24"><path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41z"/></svg>` // X
@@ -750,11 +928,35 @@ function createCardHtml(item) {
         retryHtml = `
         <button class="action-btn" id="retry-${safeId}" title="Retry">
             <svg class="icon" viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-        </button>
-        `;
+        </button>`;
     }
 
-    const speedText = formatSpeed(item.speed);
+    return `
+        <a href="${item.url}" target="_blank" class="action-btn" title="Open Link" style="text-decoration:none; height:auto;">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+        </a>
+        ${(item.status === 'finished' && item.filename) ? `
+        <button class="action-btn" id="play-${safeId}" title="Play">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        </button>
+        <button class="action-btn" id="download-${safeId}" title="Download">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        </button>` : ''}
+        ${retryHtml}
+        <button class="action-btn" id="action-${safeId}" title="${isActive ? 'Cancel' : 'Delete'}">
+            ${actionIcon}
+        </button>`;
+}
+
+function createCardHtml(item) {
+    const safeId = getSafeId(item.url);
+    const statusClass = normalizeStatus(item.status);
+    const percent = getPercent(item);
+    const title = item.title || item.url || 'Unknown Video';
+    const isError = item.status === 'error';
+    const msg = item.msg || '';
+
+    const speedText = formatSpeed(item.speed, item.url);
     const etaText = formatEta(item.eta);
 
     return `
@@ -773,21 +975,7 @@ function createCardHtml(item) {
                     <span id="eta-${safeId}">${etaText}</span>
                 </div>
                 <div class="footer-controls" style="display:flex;">
-                    <a href="${item.url}" target="_blank" class="action-btn" title="Open Link" style="text-decoration:none; height:auto;">
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
-                    </a>
-                    ${item.status === 'finished' ? `
-                    <button class="action-btn" id="play-${safeId}" title="Play">
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                    </button>
-                    <button class="action-btn" id="download-${safeId}" title="Download">
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                    </button>
-                    ` : ''}
-                    ${retryHtml}
-                    <button class="action-btn" id="action-${safeId}" title="${isActive ? 'Cancel' : 'Delete'}">
-                        ${actionIcon}
-                    </button>
+                    ${getFooterHtml(item, safeId)}
                 </div>
             </div>
         </div>
@@ -833,7 +1021,7 @@ function updateItemInDom(item, baseUrl) {
 
     const speed = document.getElementById(`speed-${safeId}`);
     if (speed) {
-        const text = formatSpeed(item.speed);
+        const text = formatSpeed(item.speed, item.url);
         if (speed.textContent !== text) speed.textContent = text;
     }
 
@@ -853,48 +1041,29 @@ function updateItemInDom(item, baseUrl) {
             // Surgical replacement of action controls if they changed
             const footerControls = card.querySelector('.footer-controls');
             if (footerControls) {
-                const isError = item.status === 'error';
-                const isActive = ['pending', 'preparing', 'downloading'].includes(item.status);
-                const actionIcon = isActive
-                    ? `<svg class="icon" viewBox="0 0 24 24"><path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41z"/></svg>` // X
-                    : `<svg class="icon" viewBox="0 0 24 24"><path d="M6,19c0,1.1,0.9,2,2,2h8c1.1,0,2-0.9,2-2V7H6V19z M19,4h-3.5l-1-1h-5l-1,1H5v2h14V4z"/></svg>`; // Trash
-
-                let retryHtml = '';
-                if (isError) {
-                    retryHtml = `
-                    <button class="action-btn" id="retry-${safeId}" title="Retry">
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-                    </button>
-                    `;
-                }
-
-                footerControls.innerHTML = `
-                    <a href="${item.url}" target="_blank" class="action-btn" title="Open Link" style="text-decoration:none; height:auto;">
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
-                    </a>
-                    ${item.status === 'finished' ? `
-                    <button class="action-btn" id="play-${safeId}" title="Play">
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                    </button>
-                    <button class="action-btn" id="download-${safeId}" title="Download">
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                    </button>
-                    ` : ''}
-                    ${retryHtml}
-                    <button class="action-btn" id="action-${safeId}" title="${isActive ? 'Cancel' : 'Delete'}">
-                        ${actionIcon}
-                    </button>
-                `;
-
-                // Re-bind listeners
-                // We reuse attachCardListeners but we need the card element
-                // attachCardListeners expects the card element to find the buttons inside it.
-                // Since we just updated internal HTML of footerControls which is inside card,
-                // we can just pass the card.
+                footerControls.innerHTML = getFooterHtml(item, safeId);
                 attachCardListeners(card, safeId, item, baseUrl);
             }
         }
     }
+}
+
+function isAudioType(item) {
+    return item.download_type === 'audio' || item.format === 'mp3' || item.format === 'm4a' || item.format === 'opus';
+}
+
+function getDownloadUrl(item, baseUrl) {
+    if (!item || !item.filename) return '';
+
+    let base = baseUrl.replace(/\/$/, '');
+    const path = isAudioType(item) ? '/audio_download/' : '/download/';
+
+    let fullPath = path;
+    if (item.folder) {
+        fullPath += item.folder + '/';
+    }
+
+    return base + fullPath + encodeURIComponent(item.filename);
 }
 
 function removeElement(url) {
@@ -935,15 +1104,26 @@ function getPercent(item) {
     return 0;
 }
 
-function formatSpeed(speed) {
+function formatSpeed(speed, url) {
     if (speed === null || speed === undefined || isNaN(speed) || speed <= 0) {
+        if (url) speedHistory.delete(url);
         return '';
     }
+
+    let displaySpeed = speed;
+    if (url) {
+        let history = speedHistory.get(url) || [];
+        history.push(speed);
+        if (history.length > 8) history.shift(); // Smooth last 8 samples (~8 seconds of history)
+        speedHistory.set(url, history);
+        displaySpeed = history.reduce((a, b) => a + b, 0) / history.length;
+    }
+
     const k = 1024;
     const dm = 2; // decimals
-    const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s', 'PB/s', 'EB/s', 'ZB/s', 'YB/s'];
-    const i = Math.floor(Math.log(speed) / Math.log(k));
-    return parseFloat((speed / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+    const i = Math.floor(Math.log(displaySpeed) / Math.log(k));
+    return parseFloat((displaySpeed / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
 function formatEta(value) {
@@ -960,71 +1140,53 @@ function formatEta(value) {
     const minutes = value % 3600;
     return `${hours}h ${Math.floor(minutes / 60)}m ${Math.round(minutes % 60)}s`;
 }
-
-async function addDownload(baseUrl, options) {
-    const apiUrl = `${baseUrl.replace(/\/$/, '')}/add`;
-    const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(options)
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.json();
-}
-
-async function handleAction(baseUrl, item) {
+function handleAction(baseUrl, item) {
     const apiUrl = `${baseUrl.replace(/\/$/, '')}/delete`;
     const isActive = ['pending', 'preparing', 'downloading'].includes(item.status);
     const where = isActive ? 'queue' : 'done';
 
     try {
-        await fetch(apiUrl, {
+        fetch(apiUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ids: [item.url], where: where })
         });
-        // UI update will happen via socket 'canceled' or 'cleared' event
     } catch (e) {
         console.error('Delete failed', e);
-        const msg = e.message === 'Failed to fetch' ? 'Connection failed' : 'Action failed';
-        showToast(msg);
     }
 }
 
 async function retryDownload(baseUrl, item) {
-    // Retry means re-adding the download with same options
-    // Assuming item contains the original options or we use current defaults? 
-    // MeTube's `retryDownload` uses the item's stored options.
-
-    // We first delete the failed item from 'done' (as per MeTube app.ts)
-    // Then re-add it.
-
     try {
         setLoading(true);
-        // Delete old one by URL
+        // Delete old one
         await fetch(`${baseUrl.replace(/\/$/, '')}/delete`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ids: [item.url], where: 'done' })
         });
 
-        // Add new one
-        await addDownload(baseUrl, {
-            url: item.url,
-            quality: item.quality,
-            format: item.format,
-            folder: item.folder,
-            custom_name_prefix: item.custom_name_prefix,
-            playlist_item_limit: item.playlist_item_limit || 0,
-            split_by_chapters: item.split_by_chapters,
-            auto_start: true
-        });
-
+        // Add new one via background queue
+        const task = {
+            baseUrl: baseUrl,
+            options: {
+                url: item.url,
+                quality: item.quality,
+                format: item.format,
+                codec: 'auto',
+                folder: item.folder,
+                custom_name_prefix: item.custom_name_prefix,
+                playlist_item_limit: item.playlist_item_limit || 0,
+                split_by_chapters: item.split_by_chapters,
+                auto_start: true
+            },
+            cookieUpload: false,
+            tabId: null
+        };
+        await chrome.runtime.sendMessage({ type: 'QUEUE_DOWNLOAD', task: task });
         showToast('Retrying Download...');
     } catch (e) {
         console.error('Retry failed', e);
-        const msg = e.message === 'Failed to fetch' ? 'Connection failed' : 'Retry Failed';
-        showToast(msg);
     } finally {
         setLoading(false);
     }
@@ -1045,7 +1207,6 @@ function setupChangeListeners() {
         document.getElementById(id).addEventListener('change', checkChanges);
     });
 
-    // Special handler for format change to update qualities
     document.getElementById('format-select').addEventListener('change', (e) => {
         populateQualities(e.target.value);
         checkChanges();
@@ -1077,7 +1238,6 @@ function checkChanges() {
     const toast = document.getElementById('remember-toast');
     if (hasChanges) {
         toast.style.display = 'flex';
-        // Small delay to allow display:flex to apply before opacity transition
         requestAnimationFrame(() => {
             toast.style.opacity = '1';
         });
@@ -1103,14 +1263,13 @@ function saveSettings() {
 
     chrome.storage.sync.set(current, () => {
         savedSettings = { ...savedSettings, ...current };
-        checkChanges(); // Should hide the toast
+        checkChanges();
         showToast('Settings saved as default');
     });
 }
 
 function populateFormats(preferredValue) {
     const select = document.getElementById('format-select');
-    // If we passed a value, that's what we want. If not, try to keep current value.
     const current = preferredValue || select.value;
 
     select.innerHTML = '';

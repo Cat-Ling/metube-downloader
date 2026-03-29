@@ -334,6 +334,16 @@
             transform: translateX(-50%) translateY(0);
         }
 
+        .toast.success {
+            background-color: var(--success);
+            color: #fff;
+        }
+
+        .toast.error {
+            background-color: var(--danger);
+            color: #fff;
+        }
+
         .icon {
             width: 16px;
             height: 16px;
@@ -671,7 +681,37 @@
             </div>
         </div>
 
-        <button id="download-btn" class="btn-primary" style="margin-top:20px;">
+        <div class="cookie-section" style="margin-top: 16px;">
+            <div class="action-group-label" style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 8px;">Cookie Management</div>
+            <div style="display: flex; gap: 8px;">
+                <button id="upload-site-cookies-btn" class="btn-secondary" style="flex: 1;" title="Upload current site's cookies using the extension">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V9h2v7zm4 0h-2V9h2v7zM12 6c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2z"/>
+                    </svg>
+                    <span id="upload-site-cookies-text">Site Cookies</span>
+                </button>
+                <label for="cookie-file-input" id="upload-cookie-file-label" class="btn-secondary" style="flex: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;" title="Choose a cookies.txt file from your computer">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/>
+                    </svg>
+                    <span id="upload-cookie-file-text">Local File</span>
+                </label>
+                <button id="delete-cookies-btn" class="btn-secondary" style="display: none; color: var(--danger); background: rgba(239, 68, 68, 0.1);" title="Delete cookies from server">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12z M19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+                    </svg>
+                </button>
+            </div>
+            <input type="file" id="cookie-file-input" style="display: none;" accept=".txt">
+            <div id="cookie-status-container" style="margin-top: 8px; font-size: 11px; display: flex; align-items: center; gap: 6px; color: var(--text-muted);">
+                <span id="cookie-status-icon" style="display: flex;">
+                    <svg class="icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+                </span>
+                <span id="cookie-status-text">Checking cookie status...</span>
+            </div>
+        </div>
+
+        <button id="download-btn" class="btn-primary" style="margin-top:16px;">
             <svg class="icon" viewBox="0 0 24 24">
                 <path d="M19,9h-4V3H9v6H5l7,7L19,9z M5,18v2h14v-2H5z" />
             </svg>
@@ -740,6 +780,46 @@
 
 
     <script src="popup.js"></script>
+    <div id="clear-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content" style="border-radius: var(--border-radius, 12px); box-shadow: 0 15px 35px rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.05);">
+            <h3 style="margin-top: 0; font-size: 16px;">Clear Downloads</h3>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 24px;">Choose what to remove from history:</p>
+            <div style="display: flex; flex-direction: column; gap: 12px;">
+                <button id="clear-failed-btn" class="btn-primary" style="background-color: var(--danger);">
+                    Clear Failed
+                </button>
+                <button id="clear-completed-btn" class="btn-primary">
+                    Clear Completed
+                </button>
+                <button id="clear-all-btn" class="btn-primary" style="background-color: #475569;">
+                    Clear All (Both)
+                </button>
+                <button id="clear-cancel" class="btn-secondary" style="margin-top: 8px;">
+                    Cancel
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="cookie-confirm-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content" style="border-radius: var(--border-radius, 12px); box-shadow: 0 15px 35px rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.05); text-align: center;">
+            <div style="background: rgba(239, 68, 68, 0.1); width: 50px; height: 50px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px;">
+                <svg class="icon" style="fill: var(--danger); width: 24px; height: 24px;" viewBox="0 0 24 24">
+                    <path d="M6,19c0,1.1,0.9,2,2,2h8c1.1,0,2-0.9,2-2V7H6V19z M19,4h-3.5l-1-1h-5l-1,1H5v2h14V4z"/>
+                </svg>
+            </div>
+            <h3 style="margin-top: 0; font-size: 16px;">Delete Cookies?</h3>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 24px;">This will remove all uploaded sidecar cookies from your MeTube instance. This cannot be undone.</p>
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+                <button id="cookie-confirm-delete-btn" class="btn-primary" style="background-color: var(--danger);">
+                    Permanently Delete
+                </button>
+                <button id="cookie-confirm-cancel" class="btn-secondary">
+                    Cancel
+                </button>
+            </div>
+        </div>
+    </div>
 </body>
 
 </html>
